@@ -2,7 +2,7 @@ from strands.models import BedrockModel
 
 # DeepSeek V3.2 — replaced Claude Sonnet 4.5 (requires Marketplace subscription)
 # https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-MODEL_ID = "deepseek.deepseek-v3-2"
+MODEL_ID = "deepseek.v3.2"
 
 
 def load_model() -> BedrockModel:

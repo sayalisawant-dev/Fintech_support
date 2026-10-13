@@ -2,11 +2,7 @@ import os
 import jwt
 from typing import Optional, Dict, Any
 
-# Bypass tool consent prompts for high-agency tools
-os.environ["BYPASS_TOOL_CONSENT"] = "true"
-
 from strands import Agent
-from strands_tools import shell, file_read, file_write, editor
 from bedrock_agentcore import BedrockAgentCoreApp
 from bedrock_agentcore.memory.integrations.strands.config import (
     AgentCoreMemoryConfig,
@@ -73,17 +69,11 @@ async def invoke(payload, context):
     else:
         log.warning("MEMORY_ID is not set. Skipping memory session manager initialization.")
 
-    # High-agency tools from strands_tools
-    high_agency_tools = [shell, file_read, file_write, editor]
-
-    # Get MCP client - pass user token if available for scope-based Gateway authorization
-    # Impersonation (forwarding user token) works here because the Gateway is within our/organization trust boundary.
-    # For third-party APIs, use delegation via AgentCore Identity instead(skipped to keep demo short):
-    # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/identity-getting-started-google.html
+    # Get MCP tools from Gateway (get_customer, list_customers, get_order, list_orders, process_refund)
     strands_mcp_client = get_streamable_http_mcp_client(user_token=user_token)
 
     with strands_mcp_client as client:
-        # Get MCP Tools
+        # Get MCP Tools only — no filesystem tools
         tools = client.list_tools_sync()
 
         # Create agent
@@ -91,27 +81,24 @@ async def invoke(payload, context):
             model=load_model(),
             session_manager=session_manager,
             system_prompt=(
-                "You are a customer support agent. Your role is to answer customer questions "
-                "about orders, account information, and refund requests.\n\n"
+                "You are a customer support agent for a banking/e-commerce platform. "
+                "You have access to these tools ONLY: get_customer, list_customers, get_order, list_orders, process_refund.\n\n"
                 f"Current user:\n"
                 f"- Email: {email or 'unknown'}\n"
                 f"- Groups: {', '.join(groups) if groups else 'none'}\n\n"
                 "Guidelines:\n"
-                "- Use the customer's email to look up their account and orders automatically\n"
-                "- When showing orders, always fetch full order details (get_order) to include "
-                "item names, quantities, and prices — not just order IDs and totals\n"
-                "- Summarize information clearly and concisely for the customer\n\n"
-                "Policy enforcement:\n"
-                "- If a tool call is denied due to a policy violation, report the denial exactly "
-                "as returned by the system. Do NOT invent or guess the reason — only state what "
-                "the policy engine actually returned. Do NOT retry the same request.\n\n"
+                "- ALWAYS use the customer's email to call get_customer or list_customers first to find their account\n"
+                "- Use list_orders with the customer_id to fetch their orders\n"
+                "- Use get_order with order_id to get full order details\n"
+                "- Use process_refund with order_id, amount, and reason to process refunds\n"
+                "- NEVER search the filesystem, run shell commands, or read files — you don't have those tools\n"
+                "- If a tool call is denied by a policy, report the exact denial message and do NOT retry\n"
+                "- Give direct, concise answers based on what the tools return\n\n"
                 "When relevant memories are retrieved from previous sessions:\n"
-                "- Use stored preferences to personalize recommendations and responses\n"
-                "- Reference past facts about the customer to provide continuity\n"
-                "- Build on previous session summaries to maintain context across conversations\n"
-                "- Acknowledge returning customers and their history when appropriate"
+                "- Use stored preferences to personalize responses\n"
+                "- Reference past facts about the customer to provide continuity"
             ),
-            tools=high_agency_tools + tools,
+            tools=tools,
         )
 
         # Execute and format response

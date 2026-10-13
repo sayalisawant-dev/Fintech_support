@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# scripts/teardown.sh — destroy all AgentCore demo resources
+# scripts/teardown.sh — destroy every deployed resource of the financial assistant
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CDK_DIR="$REPO_ROOT/cdk"
+CDK_DIR="$REPO_ROOT/infra"
 OUTPUTS_FILE="$REPO_ROOT/cdk-outputs.json"
 YAML_FILE="$REPO_ROOT/.bedrock_agentcore.yaml"
 

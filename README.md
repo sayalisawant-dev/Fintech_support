@@ -1,303 +1,139 @@
-# Amazon Bedrock AgentCore Demo — Customer Support Agent
+# Financial Assistant on Amazon Bedrock AgentCore
 
-A production-ready AI customer support agent built on **Amazon Bedrock AgentCore**. This demo walks through deploying an agent, authenticating a user, invoking the agent, and then adding an AgentCore Policy to enforce refund limits in real time.
+A retail-banking assistant that answers questions about a customer's accounts, balances, card
+transactions and spending, opens disputes, and moves money between the customer's own accounts.
+It runs on **Amazon Bedrock AgentCore** (Runtime, Gateway, Memory, Policy Engine) with a
+[Strands](https://strandsagents.com) agent on **DeepSeek V3.2** (`deepseek.v3.2`, us-east-1).
 
-## Architecture
+![Architecture](docs/images/architecture.jpeg)
 
-![AgentCore Architecture](images/architecture.jpeg)
+| Component | Role |
+|---|---|
+| **AgentCore Runtime** | Hosts the containerized agent (arm64) behind a Cognito JWT authorizer |
+| **AgentCore Gateway** | MCP endpoint for the 8 banking tools; forwards the user's token and checks the `gateway:invoke` scope |
+| **AgentCore Policy Engine** | Cedar policies on `cognito:groups` and tool arguments (for example, dispute and transfer limits) |
+| **AgentCore Memory** | Per-user facts, preferences, session summaries and episodes (`financialAssistant_Memory`) |
+| **Amazon Cognito** | Sign-in; access tokens carry `sub`, the username (the email) and `cognito:groups` |
+| **AWS Lambda** | One function with the mock banking APIs, shared by both Gateway targets |
+| **Amazon CloudWatch** | OpenTelemetry traces, logs and metrics; AgentCore built-in evaluations read the traces |
 
-| Component | Purpose |
-|-----------|---------|
-| **AgentCore Runtime** | Hosts the containerized Strands agent (DeepSeek V3.2) with JWT auth |
-| **AgentCore Gateway** | MCP-based tool gateway — routes tool calls to Lambda backends |
-| **AgentCore Policy Engine** | Evaluates Cedar policies against JWT claims to allow/deny tool calls |
-| **AgentCore Memory** | Per-user persistent memory (facts, preferences, summaries, episodes) |
-| **Cognito** | User authentication — issues JWTs with `email`, `cognito:groups` claims |
-| **Lambda Functions** | Mock customer and order APIs (get/list customers, get/list orders, process refund) |
-| **CloudWatch** | Auto-instrumented OpenTelemetry traces for every invocation |
+Safety is layered: the system prompt sets the rules, a code-level gate makes disputes and transfers
+wait for an explicit "yes" in a separate turn, and the Policy Engine enforces limits at the Gateway,
+outside the model. See [docs/architecture.md](docs/architecture.md).
 
----
+## Repository layout
+
+```
+.
+├── src/financial_assistant/     # the agent (container image)
+│   ├── main.py                  #   AgentCore Runtime entrypoint
+│   ├── auth.py                  #   caller identity from the Cognito JWT
+│   ├── prompts.py               #   system prompt
+│   ├── guardrails.py            #   confirmation gate for disputes and transfers
+│   ├── streaming.py             #   strips DeepSeek's leaked tool-call markup from the stream
+│   ├── memory.py                #   AgentCore Memory session manager
+│   ├── gateway.py               #   MCP client for the AgentCore Gateway
+│   ├── model.py                 #   Bedrock model
+│   └── config.py                #   settings from the Runtime's environment
+├── lambdas/banking_tools/       # banking tools behind the Gateway (one Lambda)
+├── infra/                       # AWS CDK app (TypeScript): image, Runtime, Gateway, Memory, Cognito
+├── scripts/                     # deploy, teardown, Cognito users/login, observability, model check
+├── ui/                          # Streamlit chat UI (Cognito sign-in, calls the deployed Runtime)
+├── evals/                       # evaluation conversations + runner (AgentCore built-in evaluators)
+├── tests/unit/                  # pytest: agent modules and Lambda tools
+├── docs/                        # architecture, Policy Engine, EC2 runbook, troubleshooting
+├── Dockerfile                   # arm64 image, dependencies from uv.lock
+├── pyproject.toml / uv.lock     # Python project and locked dependencies
+└── Makefile                     # shortcuts: install, lint, test, synth, deploy, eval
+```
 
 ## Prerequisites
 
-### Clone the Repository
+- An **arm64** build machine (AgentCore Runtime only runs arm64 images). The reference setup is an
+  Amazon Linux 2023 **t4g.medium** EC2 instance in **us-east-1**.
+- [uv](https://docs.astral.sh/uv/getting-started/installation/), Node.js 20+, Docker, AWS CLI v2.32+.
+- AWS credentials with permission to deploy CDK stacks (Lambda, Cognito, ECR, IAM, AgentCore).
+- Amazon Bedrock model access to **DeepSeek V3.2** in the deployment Region.
 
-1. **Verify git is installed:**
+The full step-by-step guide, including setting up the EC2 instance from scratch, is
+[docs/runbooks/commands_ec2.txt](docs/runbooks/commands_ec2.txt).
 
-   ```bash
-   git --version
-   ```
-
-   If git is not installed, you can get it from [git-scm.com/install/mac](https://git-scm.com/install/mac).
-
-2. **Clone and navigate to the project:**
-
-   ```bash
-   git clone https://github.com/awslabs/amazon-bedrock-agentcore-samples.git
-   cd amazon-bedrock-agentcore-samples/05-blueprints/customer-support-agent-with-agentcore
-   ```
-
-### Required Tools
-
-| Tool | Version | Install |
-|------|---------|---------|
-| **uv** (Python + packages) | Latest | [Install guide](https://docs.astral.sh/uv/getting-started/installation/) |
-| **Node.js** | 20+ | First install [nvm](https://github.com/nvm-sh/nvm#installing-and-updating), then run: `nvm install 20 && nvm use 20` |
-| **Docker** | Latest | [Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/) |
-| **AWS CLI** | **v2.32.0+** | [Install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
-
-> **Tip:** `scripts/deploy.sh` runs pre-flight checks for all of the above — tools, CLI version, AWS credentials, Docker, and Bedrock model access — and will warn you with actionable guidance if anything is missing.
-
-### AWS Credentials & Permissions
-
-> **Important:** The `aws login` command requires AWS CLI **v2.32.0 or later**. Run `aws --version` to check. If your version is older, [update the CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) before proceeding.
-
-1. **Log in** via the AWS CLI:
-
-   ```bash
-   aws login
-   ```
-
-   This opens your browser — sign in with your AWS console credentials.
-
-2. **Verify credentials:**
-
-   ```bash
-   aws sts get-caller-identity
-   ```
-[More details on aws login and credentials](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html).
-
-> **Note:** The demo deploys CDK stacks (Lambda, Cognito, ECR, IAM roles, CloudWatch), which together require broad permissions. For the simplest setup, ensure **`AdministratorAccess`** and **`SignInLocalDevelopmentAccess`** is attached to your IAM user (IAM Console → Users → your user → Add permissions → Attach policies directly). For minimum permissions, see [AgentCore Starter Toolkit permissions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html#runtime-permissions-starter-toolkit).
-
-### Enable DeepSeek Model Access
-
-The agent uses **DeepSeek V3.2** via Amazon Bedrock. You need to enable model access before first use:
- modelid - deepseek.deepseek-v3-2
-1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/) and go to **Model access**
-2. Find **DeepSeek V3.2** and enable it
-3. Wait for status to show **Access granted**
-
-> **Changing the model:** The model ID is configured in [`src/model/load.py`](src/model/load.py). Update the `MODEL_ID` variable and redeploy. Alternatives:
->
-> | Model | Model ID |
-> |-------|----------|
-> | DeepSeek V3.2 (default) | `deepseek.deepseek-v3-2` |
-> | Amazon Nova Pro | `amazon.nova-pro-v1:0` |
-> | Amazon Nova Lite | `amazon.nova-lite-v1:0` |
->
-> See [supported models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) for the full list.
-
----
-
-## Step 1: Deploy the Agent
-
-From the project root, run the deploy script. It installs dependencies, bootstraps CDK, deploys all stacks, and generates the configuration files automatically:
+## Quick start
 
 ```bash
-scripts/deploy.sh
+scripts/deploy.sh                                    # checks, uv sync, npm ci, cdk bootstrap + deploy
+uv run scripts/cognito-user.py --create              # pick john@example.com (add --group premium for jane)
+eval $(uv run scripts/cognito-user.py --login --export)   # opens Cognito login, sets the bearer token
+uv run agentcore invoke -s $(python3 -c "import uuid;print(uuid.uuid4())") '{"prompt": "What are my balances?"}'
 ```
 
-> **Note:** The first deploy takes a while — CDK builds a Docker image, pushes it to ECR, and provisions all resources (Runtime, Gateway, Memory, Cognito, Lambdas).
-
-> **Already deployed?** Run `uv run agentcore status` first. If the agent shows `READY` or `ACTIVE`, skip to Step 2.
-
-This deploys:
-- **AgentCore Runtime** — containerized agent running DeepSeek V3.2
-- **AgentCore Gateway** — MCP-based tool gateway with JWT authorization
-- **AgentCore Memory** — persistent memory scoped per user
-- **Cognito User Pool** — user authentication
-- **Lambda Functions** — backend APIs for customer/order data
-
-Verify it's running:
+Later deploys after a code change:
 
 ```bash
-uv run agentcore status
+cd infra && npx cdk deploy --all --outputs-file ../cdk-outputs.json --require-approval never
 ```
 
----
-
-## Step 2: Create a User and Get a Bearer Token
-
-The demo uses Amazon Cognito for authentication.
-
-### Create a user
+Chat UI (needs only `cdk-outputs.json` and a Cognito user, no AWS credentials):
 
 ```bash
-uv run scripts/cognito-user.py --create
+make ui        # then open http://localhost:8501; on EC2 forward ports 3000 and 8501 over SSH
 ```
 
-The script prompts you for an email and password. Use an email that matches one of the backend's mock customers so the agent can look up your orders:
+Step-by-step: [docs/runbooks/ui_guide.txt](docs/runbooks/ui_guide.txt).
 
-| Name | Email |
-|------|-------|
-| John Doe | `john@example.com` |
-| Jane Smith | `jane@example.com` |
+The login needs port 3000 forwarded to the machine running the script
+(`ssh -L 3000:localhost:3000 ...`). Mock customers are `john@example.com` (CUST-001) and
+`jane@example.com` (CUST-002).
 
-This creates the user in the Cognito user pool and assigns them to the `standard` group. You'll use the password you chose when logging in via the browser.
+## Configuration
 
-### Log in and get a token
+The CDK stack sets these on the Runtime; nothing is hard-coded in the agent.
+
+| Variable | Set from | Purpose |
+|---|---|---|
+| `MODEL_ID` | `cdk deploy -c modelId=...` (default `deepseek.v3.2`) | Bedrock model |
+| `GATEWAY_URL` | Gateway resource | MCP endpoint for the tools |
+| `BEDROCK_AGENTCORE_MEMORY_ID` | Memory resource | Memory used for this user's sessions |
+| `AWS_REGION` | Stack Region | Bedrock and Memory Region |
+| `LOCAL_DEV=1` | set by hand | Run the agent without a Gateway (no tools) |
+
+## Development
 
 ```bash
-eval $(uv run scripts/cognito-user.py --login --export)
+make install       # uv sync --locked + npm ci (infra)
+make check         # ruff lint + format check, tsc, pytest, CDK template tests
+make synth         # cdk synth, no Docker needed
 ```
 
-This opens your browser for a Cognito login, then sets the bearer token as an environment variable (`BEDROCK_AGENTCORE_BEARER_TOKEN`).
+CI (`.github/workflows/ci.yml`) runs the same checks on every push and pull request. The CDK tests
+also check that every tool schema the Gateway exposes has a handler in the Lambda.
 
----
+## Policies, observability and evaluations
 
-## Step 3: Invoke the Agent
+- **Policy Engine:** Cedar policies are created in the console; see [docs/policy-engine.md](docs/policy-engine.md).
+- **Observability:** `uv run scripts/observability.py setup` turns on CloudWatch Transaction Search
+  and Gateway/Memory log and trace delivery; `check` reports what is flowing.
+- **Evaluations:** `uv run evals/run_eval.py` runs the conversations in `evals/cases.json` and scores
+  them with AgentCore built-in evaluators, or score one session with
+  `uv run agentcore eval run -s <session-id> -e Builtin.GoalSuccessRate ...`.
 
-With your token set, invoke the agent:
-
-```bash
-uv run agentcore invoke '{"prompt": "Who am I?"}'
-```
-
-The agent identifies you from the JWT token — your email, group, and permissions. No API keys or service accounts. Real user identity flows end-to-end.
-
-Now try fetching orders and processing a refund:
-
-```bash
-uv run agentcore invoke '{"prompt": "Show me my recent orders"}'
-```
-
-```bash
-uv run agentcore invoke '{"prompt": "I need a refund for order ORD-12420. The phone case was damaged."}'
-```
-
-The refund succeeds. At this point there is **no policy restricting** the refund amount — the agent can process any amount.
-
----
-
-## Step 4: Request a Large Refund (No Policy Yet)
-
-Try a large refund to establish a baseline:
-
-```bash
-uv run agentcore invoke '{"prompt": "I need a refund of $399 for order ORD-12430. The monitor has dead pixels."}'
-```
-
-The refund goes through because no Cedar policy is in place to block it. The agent has unrestricted access to the `process_refund` tool.
-
----
-
-## Step 5: Add AgentCore Policies
-
-Now add policies to control which tools the agent can call and under what conditions. AgentCore policies are enforced at the **Gateway layer** — outside the AI model — so the agent cannot bypass them.
-
-### 5a. Create a Policy Engine
-
-1. Open the **AWS Console** (confirm region), search for **Amazon Bedrock AgentCore** in the search bar, then navigate to **Policy Engine** and click **Create policy engine**
-2. Click Add policies, select supportAgentDemo gateway in resource scope dropdown.
-
-
-### 5b. Add Policy 1 — Allow all tools except `process_refund`
-
-This policy permits all read-only tools for any authenticated user:
-
-Type in prompt "Allow all authenticated users to call get_customer, list_customers, get_order, and list_orders" > Click Generate Cedar > Create policy
-
-### 5c. Add Policy 2 — Restrict `process_refund` by group and amount
-
-This policy allows the `standard` group to call `process_refund` only when the refund amount is $100 or less:
-
-Type in prompt "Allow users in the standard cognito:groups to call process_refund only when the amount is less than or equal to 100" > Click Generate Cedar > Create policy
-
-![Create Policy UI](images/create_policy.png)
-
-### 5d. Enable the Policy Engine
-
-After adding both policies, **associate** the policy engine to supportAgentDemo gateway. Policies take effect immediately — no redeployment needed.
-
-![Associate Policy Engine UI](images/associate_policy_engine.png)
-
-### How it works
-
-```
-User Request → AgentCore Runtime → AgentCore Gateway → Cedar Policy Engine → Backend
-                                         ↑
-                                   Evaluates JWT claims
-                                   (cognito:groups) against
-                                   Cedar policies
-```
-
-1. User authenticates via Cognito and gets a JWT with `cognito:groups` claim
-2. Agent calls a tool through the Gateway
-3. Gateway sends user claims + request context to the Policy Engine
-4. Policy Engine evaluates Cedar policies and returns allow/deny
-5. If denied, the Gateway blocks the tool call before it reaches the backend
-
----
-
-## Step 6: Invoke Again — Policy Blocks the Refund
-
-Try the same large refund again:
-
-```bash
-uv run agentcore invoke '{"prompt": "I need a full refund for order ORD-12300. The shoes dont fit."}'
-```
-
-This time the refund is **blocked** by the AgentCore policy. The agent receives a policy violation from the Gateway and informs the user.
-
-The key takeaway: the agent can be jailbroken, the model can hallucinate, but the policy layer doesn't care — it enforces rules regardless. The security boundary is in the infrastructure, not in the AI.
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `aws: error: argument command: Invalid choice 'login'` | AWS CLI version is below v2.32.0. [Update to latest](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
-| `agentcore: command not found` | Use `uv run agentcore` (installed in project venv), or install globally: `uv pip install bedrock-agentcore-starter-toolkit` |
-| Token script fails to open browser | Copy the URL from terminal output and open manually |
-| "Unauthorized" when invoking | Token expired (1 hour). Re-run `eval $(uv run scripts/cognito-user.py --login --export)` |
-| CDK deploy fails | Ensure Docker is running. Check credentials: `aws sts get-caller-identity` |
-| `node -v` shows version < 20 | Install Node 20+: `nvm install 20 && nvm use 20` |
-| Port 3000 in use (token script) | Kill the process: `lsof -ti:3000 \| xargs kill` |
-
----
-
-## Footnotes
-
-### Checking Traces (Observability)
-
-Every agent invocation is instrumented with OpenTelemetry out of the box. To inspect traces:
-
-1. Navigate to **CloudWatch** → **GenAI Observability** → **Bedrock AgentCore**
-2. In All Sessions tab, filter by session ID matching your invocations
-
-> **Note:** If this is your first time using traces, CloudWatch will show a banner prompting you to enable **Transaction Search** — this is a one-time account setup.
-
-Each trace shows:
-- **Full request lifecycle** — from initial request through to response
-- **Tool calls** — every call the agent made through the Gateway (e.g., `list_orders`, `process_refund`)
-- **Policy evaluations** — whether the Policy Engine allowed or denied each tool call
-- **Memory operations** — retrieval and storage of user preferences/facts
-- **Model inference** — latency, token counts, model ID
-
-This is useful for debugging policy denials. After Step 6, look for the `process_refund` tool call trace — you'll see the Gateway's policy evaluation returning a deny decision with the Cedar policy that blocked it.
-
-No custom logging code is required. AgentCore instruments all of this automatically via the OpenTelemetry distro bundled in the container image (`aws-opentelemetry-distro`).
-
-### Session IDs
-
-By default, each `uv run agentcore invoke` call generates a new session. To start a named session, pass a session ID with the `-s` flag once — the AgentCore CLI remembers it for subsequent invocations:
-
-```bash
-uv run agentcore invoke -s $(uuidgen) '{"prompt": "Show me my recent orders"}'
-
-# Subsequent calls automatically use the same session
-uv run agentcore invoke '{"prompt": "Refund the headphones"}'
-```
-
-The agent runtime and memory (preferences, facts, session summaries) is scoped per session and user. Using the same session lets the agent reference earlier parts of the conversation.
-
-### Cleanup
-
-To destroy all deployed resources and remove generated config files:
+## Cleanup
 
 ```bash
 scripts/teardown.sh
 ```
 
-This runs `cdk destroy` on all stacks and removes `cdk-outputs.json` and `.bedrock_agentcore.yaml`.
+Detach and delete the Policy Engine in the console first. `scripts/observability.py teardown`
+removes the log deliveries that setup created.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Components, request flow, code map, safety layers, design decisions |
+| [docs/policy-engine.md](docs/policy-engine.md) | Creating the Cedar policies and attaching them to the Gateway |
+| [docs/runbooks/commands_ec2.txt](docs/runbooks/commands_ec2.txt) | End-to-end EC2 guide, every command in order |
+| [docs/runbooks/troubleshooting.md](docs/runbooks/troubleshooting.md) | Known errors and fixes |
+| [infra/README.md](infra/README.md) | CDK stacks and commands |
+| [lambdas/README.md](lambdas/README.md) | Banking tools and how to add one |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |

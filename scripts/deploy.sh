@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh — one-command deployment for the AgentCore Support Demo
+# scripts/deploy.sh — one-command deployment of the financial assistant: pre-flight checks,
+# dependencies, CDK bootstrap and deploy, then .bedrock_agentcore.yaml for the agentcore CLI.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CDK_DIR="$REPO_ROOT/cdk"
+CDK_DIR="$REPO_ROOT/infra"
 OUTPUTS_FILE="$REPO_ROOT/cdk-outputs.json"
 YAML_FILE="$REPO_ROOT/.bedrock_agentcore.yaml"
 STACK_KEY="supportAgentDemo-AgentCoreStack"
@@ -61,32 +62,22 @@ if [ -d "$NPM_CACHE_DIR" ]; then
     fi
 fi
 
-# Check Bedrock model access for required model (DeepSeek V3.2)
-# Note: This tests the *deployer's* credentials. The agent runtime uses its own execution role,
-# so a failure here does not necessarily mean the deployed agent will fail.
-REQUIRED_MODEL="deepseek.deepseek-v3-2"
-echo "    Verifying Bedrock model access ($REQUIRED_MODEL)..."
-if BODY_FILE=$(mktemp 2>/dev/null) && \
-   echo -n '{"messages":[{"role":"user","content":"hi"}],"max_tokens":32}' > "$BODY_FILE" && \
-   aws bedrock-runtime invoke-model --model-id "$REQUIRED_MODEL" \
-       --content-type "application/json" --accept "application/json" \
-       --cli-connect-timeout 5 --cli-read-timeout 10 \
-       --body "fileb://$BODY_FILE" /dev/null > /dev/null 2>&1; then
-    rm -f "$BODY_FILE"
-    echo "    Model access verified."
-else
-    rm -f "${BODY_FILE:-}"
-    echo "WARNING: Could not invoke Bedrock model ($REQUIRED_MODEL)." >&2
-    echo "         Possible reasons:" >&2
-    echo "" >&2
-    echo "         1. Model access not enabled in Bedrock console." >&2
-    echo "            Enable it at: https://console.aws.amazon.com/bedrock/home#/modelaccess" >&2
-    echo "" >&2
-    echo "         2. Your current IAM identity lacks bedrock:InvokeModel permission." >&2
-    echo "            Note: the deployed agent uses its own execution role, so this may not" >&2
-    echo "            be a problem. Verify after deployment with: uv run agentcore invoke" >&2
-    echo "" >&2
-    echo "         The deploy will continue." >&2
+# AgentCore Runtime only accepts arm64 images. Building on x86 needs QEMU emulation
+# and is slow and fragile, so run this on a Graviton (t4g) instance.
+if [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "arm64" ]; then
+    echo "WARNING: This machine is $(uname -m). Use an arm64 (t4g) EC2 instance for native image builds." >&2
+fi
+
+# Check the agent's Bedrock model the way Strands calls it (ConverseStream + tools).
+# A wrong model ID or a model without tool support breaks every invocation, so stop here.
+export MODEL_ID="${MODEL_ID:-deepseek.v3.2}"
+echo "    Verifying Bedrock model ($MODEL_ID) with tool use..."
+if [ "${SKIP_MODEL_CHECK:-0}" != "1" ]; then
+    if ! (cd "$REPO_ROOT" && uv run --quiet scripts/check_model.py --model-id "$MODEL_ID"); then
+        echo "ERROR: Model check failed. Fix the model (or set MODEL_ID) before deploying." >&2
+        echo "       Set SKIP_MODEL_CHECK=1 to deploy anyway." >&2
+        exit 1
+    fi
 fi
 
 echo "    All checks passed."
@@ -99,8 +90,8 @@ echo "==> Installing Python dependencies (uv sync)"
 (cd "$REPO_ROOT" && uv sync)
 
 echo ""
-echo "==> Installing CDK dependencies (npm install)"
-(cd "$CDK_DIR" && npm install)
+echo "==> Installing CDK dependencies (npm ci)"
+(cd "$CDK_DIR" && npm ci)
 
 # ---------------------------------------------------------------------------
 # Bootstrap & Deploy
@@ -111,7 +102,7 @@ echo "==> Bootstrapping CDK (if needed)"
 
 echo ""
 echo "==> Deploying all stacks"
-(cd "$CDK_DIR" && npm run cdk:deploy:ci -- --outputs-file "$OUTPUTS_FILE")
+(cd "$CDK_DIR" && npm run cdk:deploy:ci -- -c modelId="$MODEL_ID" --outputs-file "$OUTPUTS_FILE")
 
 if [ ! -f "$OUTPUTS_FILE" ]; then
     echo "ERROR: CDK deploy succeeded but $OUTPUTS_FILE was not created." >&2
@@ -145,10 +136,10 @@ agents:
     name: supportAgentDemo_Agent
     language: python
     node_version: null
-    entrypoint: ./src/main.py
+    entrypoint: ./src/financial_assistant/main.py
     deployment_type: container
     runtime_type: null
-    platform: linux/amd64
+    platform: linux/arm64
     container_runtime: null
     source_path: ./src
     aws:
@@ -233,6 +224,10 @@ echo "       eval \$(uv run scripts/cognito-user.py --login --export)"
 echo ""
 echo "  4. Invoke the agent:"
 echo "       uv run agentcore invoke '{\"prompt\": \"Who am I?\"}'"
+echo ""
+echo "  5. Turn on observability, then run the evaluation suite:"
+echo "       uv run scripts/observability.py setup"
+echo "       uv run evals/run_eval.py"
 echo ""
 echo "  To tear down all resources later:"
 echo "       scripts/teardown.sh"

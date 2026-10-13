@@ -1,27 +1,54 @@
-
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "supportAgentDemo"
-version = "0.1.0"
+name = "financial-assistant"
+version = "0.2.0"
+description = "Retail-banking financial assistant on Amazon Bedrock AgentCore (Runtime, Gateway, Memory, Policy)"
 requires-python = ">=3.10"
 
+# Runtime dependencies: installed into the container image from uv.lock (see Dockerfile).
 dependencies = [
     "bedrock-agentcore >= 1.2.1",
     "botocore[crt]",
-    "mcp >= 1.19.0",
+    "mcp >= 1.24.0, < 2",
     "pyjwt>=2.11.0",
-    "pytest >= 7.0.0",
-    "pytest-asyncio >= 0.21.0",
     "chardet >= 3.0.2, < 6.0.0",
     "requests >= 2.32.5",
     "strands-agents >= 1.25.0",
-    "strands-agents-tools >= 0.2.20",
+    "aws-opentelemetry-distro >= 0.18.0",
 ]
 
+# Local tooling only (agentcore CLI, tests, lint); not installed in the image.
 [dependency-groups]
 dev = [
     "bedrock-agentcore-starter-toolkit>=0.3.2",
+    "pytest >= 7.0.0",
+    "ruff >= 0.6.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "lambdas", "ui"]
+addopts = "-ra"
+filterwarnings = [
+    # third-party deprecations we cannot fix here
+    "ignore::DeprecationWarning:bedrock_agentcore.*",
+    "ignore:Support for class-based `config` is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["infra", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # line length is left to the formatter
+
+[tool.ruff.lint.isort]
+known-first-party = ["financial_assistant", "banking_tools", "agent_client"]

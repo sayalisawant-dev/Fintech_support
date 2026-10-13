@@ -1,0 +1,427 @@
+## =====================================================================================
+##  FINANCIAL ASSISTANT ON AMAZON BEDROCK AGENTCORE — END-TO-END EC2 GUIDE
+##  Last updated: 2026-10-07 (v0.2.0 folder layout: src/financial_assistant, lambdas, infra, evals, docs)
+##
+##  Covers every step: connect -> set up EC2 -> get code -> deploy -> users -> login ->
+##  test the assistant -> Policy -> traces/observability -> evaluations -> save/backup ->
+##  update after a change -> cleanup.
+##
+##  HOW TO READ THIS FILE
+##   [PC]   = run in Git Bash on your laptop      (prompt looks like: Shakti@LAPTOP-... )
+##   [EC2]  = run on the EC2 server               (prompt looks like: [ec2-user@ip-... ]$ )
+##   [WEB]  = do it in the AWS console or a browser
+##   Paste ONE block at a time and wait for it to finish.
+##   Lines starting with ## are notes — do not paste them. Lines starting with "# " are optional.
+##
+##  YOUR VALUES
+##   Key file : C:\Users\Shakti\Downloads\Finance_support001.pem  (~/Downloads/... in Git Bash)
+##   EC2 IP   : 34.228.41.24      (changes if the instance is stopped/started — update below)
+##   Region   : us-east-1         (DeepSeek V3.2 = model id deepseek.v3.2, in-Region only)
+##   Project  : ~/Banking_support on EC2 (folder layout: README.md -> "Repository layout")
+##   Users    : john@example.com (group standard), jane@example.com (group premium)
+## =====================================================================================
+
+
+## =====================================================================================
+## STEP 0 — Connect to EC2                                                       [PC]
+## =====================================================================================
+
+## 0.1 One time only: make the key private (Git Bash)
+chmod 400 ~/Downloads/Finance_support001.pem
+
+## 0.2 Connect WITH the login tunnel (always use this one — port 3000 is needed for login)
+ssh -i ~/Downloads/Finance_support001.pem -L 3000:localhost:3000 ec2-user@34.228.41.24
+
+## The prompt must now say [ec2-user@ip-...]$ . Everything below marked [EC2] runs here.
+## If you see "REMOTE HOST IDENTIFICATION HAS CHANGED":   ssh-keygen -R 34.228.41.24
+## To leave EC2 and go back to your PC:                   exit
+
+
+## =====================================================================================
+## STEP 1 — Set up a NEW EC2 instance (skip if your instance already works)      [EC2]
+## =====================================================================================
+## Instance: Amazon Linux 2023 **arm64**, t4g.medium, 30 GB gp3, region us-east-1.
+
+uname -m                                   # must print: aarch64
+
+sudo dnf update -y
+sudo dnf install -y git docker unzip tar python3-pip make
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker                              # opens a new shell with docker rights
+docker info >/dev/null && echo "DOCKER OK"
+
+## Node.js 20 (for AWS CDK)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
+nvm install 20 && nvm use 20 && nvm alias default 20
+node -v                                    # v20.x
+
+## uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv --version
+
+## AWS CLI v2 (arm64)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o awscliv2.zip
+unzip -q awscliv2.zip && sudo ./aws/install --update
+aws --version                              # 2.32.0 or newer
+
+## AWS credentials (Region us-east-1, output json)
+aws configure
+aws sts get-caller-identity                # shows your account 532147629065
+
+## Bedrock model access: [WEB] Bedrock console -> Model access -> enable "DeepSeek V3.2" in us-east-1.
+
+
+## =====================================================================================
+## STEP 2 — Get the project onto EC2                                            [EC2]
+## =====================================================================================
+## Pick ONE option.
+
+## Option A — you already have ~/Banking_support (your current instance): nothing to do.
+cd ~/Banking_support && ls
+
+## Option B — restore from your S3 backup (see STEP 11 for how the backup is made)
+# ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+# mkdir -p ~/Banking_support
+# aws s3 sync s3://fintech-assistant-backup-$ACCOUNT/Banking_support ~/Banking_support
+
+## Option C — copy a backup archive from your PC                              [PC] then [EC2]
+#   [PC]  scp -i ~/Downloads/Finance_support001.pem ~/Downloads/fintech_backup.tgz ec2-user@34.228.41.24:~/
+#   [EC2] mkdir -p ~/Banking_support && tar -xzf ~/fintech_backup.tgz -C ~/Banking_support
+
+## Always after getting code: fix Windows line endings and check the key fixes are present
+cd ~/Banking_support
+find . -path ./infra/node_modules -prune -o -path ./.venv -prune -o \
+     \( -name "*.py" -o -name "*.sh" -o -name "*.ts" -o -name "*.json" -o -name "*.toml" \) -type f -print0 | xargs -0 sed -i 's/\r$//'
+chmod +x scripts/*.sh
+ls src/financial_assistant/main.py lambdas/banking_tools/handler.py infra/bin/app.ts   # new layout (v0.2.0)
+grep -n "deepseek.v3.2" src/financial_assistant/config.py              # model id
+grep -n "platform=linux/arm64" Dockerfile                              # arm64 image
+grep -n "def confirmation_gate" src/financial_assistant/guardrails.py  # confirmation gate
+grep -c "bankingToolsLambda.functionArn" infra/lib/stacks/agentcore-stack.ts   # prints 2: both targets share one Lambda
+grep -n 'name: "financialAssistant_Memory"' infra/lib/stacks/agentcore-stack.ts  # memory name
+## Still see src/main.py, mcp/ or cdk/ ?  That is the old layout: do STEP 2b once.
+
+
+## =====================================================================================
+## STEP 2b — ONE TIME: switch an existing instance to the v0.2.0 layout       [PC] + [EC2]
+## =====================================================================================
+## Only if `ls ~/Banking_support` still shows cdk/ mcp/ src/main.py. New installs skip this.
+## The old folder is kept as ~/Banking_support_old. Stack names are unchanged, so the deploy
+## updates the same Runtime, Gateway, Memory and Cognito users in place.
+
+## 2b.1 [PC] Save Fintech_support_source.tgz (Project_Demo folder) to Downloads, then copy it:
+#   ls -l ~/Downloads/Fintech_support_source.tgz
+#   scp -i ~/Downloads/Finance_support001.pem ~/Downloads/Fintech_support_source.tgz ec2-user@34.228.41.24:~/
+
+## 2b.2 [EC2] Keep the old folder and unpack the new one in its place
+cd ~ && [ -d ~/Banking_support/cdk ] && mv ~/Banking_support ~/Banking_support_old
+mkdir -p ~/Banking_support && tar -xzf ~/Fintech_support_source.tgz -C ~/Banking_support --strip-components=1
+cp -n ~/Banking_support_old/cdk-outputs.json ~/Banking_support/ 2>/dev/null
+cd ~/Banking_support && chmod +x scripts/*.sh && ls src/financial_assistant/main.py infra/bin/app.ts && echo "NEW LAYOUT OK"
+
+## 2b.3 [EC2] Install, test and deploy
+uv sync && (cd infra && npm ci)
+uv run pytest -q && (cd infra && npm test)          # expect 29 passed, then 8 passed
+scripts/deploy.sh                                   # checks + deploy + writes cdk-outputs.json and .bedrock_agentcore.yaml
+## The deploy rebuilds the image from uv.lock, updates the Lambda, deletes the unused customer
+## Lambda and, if the rename was not deployed before, recreates the memory as financialAssistant_Memory
+## (old memories are dropped; re-run STEP 9.2 afterwards). Then log in (STEP 6) and test (STEP 7).
+## Undo: rm -rf ~/Banking_support && mv ~/Banking_support_old ~/Banking_support, then STEP 4.2.
+
+
+## =====================================================================================
+## STEP 3 — Install dependencies and check the model                            [EC2]
+## =====================================================================================
+cd ~/Banking_support
+uv sync                                    # Python packages from uv.lock
+(cd infra && npm ci)                       # CDK packages, exactly as locked
+
+## Optional: run the tests (the same checks CI runs)
+uv run pytest -q                           # agent + Lambda unit tests
+(cd infra && npm test)                     # CDK template tests
+
+## Quick Bedrock check: DeepSeek V3.2 must answer and support tool use
+aws bedrock-runtime converse --region us-east-1 --model-id deepseek.v3.2 \
+  --messages '[{"role":"user","content":[{"text":"What is 2+2? Use the calc tool."}]}]' \
+  --tool-config '{"tools":[{"toolSpec":{"name":"calc","description":"adds numbers","inputSchema":{"json":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}}}}]}' \
+  --query 'output.message.content' --output json
+## Expect a "toolUse" block. "invalid model identifier" = wrong region; "AccessDenied" = enable model access.
+
+
+## =====================================================================================
+## STEP 4 — Deploy all AgentCore components                                     [EC2]
+## =====================================================================================
+## Creates: ECR image (arm64), AgentCore Runtime, AgentCore Gateway + CustomerTarget +
+## BankingTarget, Lambda, AgentCore Memory, Cognito user pool + groups, IAM roles.
+
+cd ~/Banking_support
+
+## 4.1 FIRST deploy on a new account/instance (bootstraps CDK and writes .bedrock_agentcore.yaml)
+scripts/deploy.sh
+
+## 4.2 Every LATER deploy (after any code change)
+cd ~/Banking_support/infra && npx cdk deploy --all --outputs-file ../cdk-outputs.json --require-approval never && cd ..
+
+## 4.3 If a deploy left the stack in ROLLBACK_COMPLETE, delete it and deploy again
+# aws cloudformation delete-stack --stack-name supportAgentDemo-AgentCoreStack --region us-east-1
+# aws cloudformation wait stack-delete-complete --stack-name supportAgentDemo-AgentCoreStack --region us-east-1
+# rm -rf infra/cdk.out
+
+## 4.4 Check every component exists
+uv run agentcore status                                                    # Runtime READY
+aws bedrock-agentcore-control list-gateways --region us-east-1 --query 'items[].[name,status]' --output table
+aws bedrock-agentcore-control list-memories --region us-east-1 --query 'memories[].[id,status]' --output table
+cat cdk-outputs.json                                                       # all IDs/URLs
+
+## 4.5 Helper used in later steps: read a value from cdk-outputs.json (paste in every new window)
+O(){ python3 -c "import json,sys;print(json.load(open('$HOME/Banking_support/cdk-outputs.json'))['supportAgentDemo-AgentCoreStack'][sys.argv[1]])" "$1"; }
+O GatewayId; O MemoryId; O RuntimeArn
+
+
+## =====================================================================================
+## STEP 5 — Create the test users (once)                                        [EC2]
+## =====================================================================================
+cd ~/Banking_support
+uv run scripts/cognito-user.py --create                     # choose 1 = john@example.com, group standard
+uv run scripts/cognito-user.py --create --group premium     # choose 2 = jane@example.com
+## Password example: Support@123  (min 8 chars, upper, lower, number, symbol)
+
+
+## =====================================================================================
+## STEP 6 — Log in and save the token (token lasts 1 hour)                      [EC2]
+## =====================================================================================
+## You MUST be in the EC2 window opened with -L 3000:localhost:3000 (STEP 0.2).
+
+cd ~/Banking_support
+pkill -f cognito-user.py; sudo fuser -k 3000/tcp 2>/dev/null; sleep 1   # frees port 3000
+eval $(uv run scripts/cognito-user.py --login --export)
+## -> copy the https link it prints into your PC browser, sign in within 2 minutes.
+##    Do NOT press Ctrl+C while it says "Waiting for callback".
+
+echo ${BEDROCK_AGENTCORE_BEARER_TOKEN:0:20}                  # prints characters = logged in
+echo "export BEDROCK_AGENTCORE_BEARER_TOKEN=$BEDROCK_AGENTCORE_BEARER_TOKEN" > ~/.agent_token
+
+## In ANY other EC2 window, load the saved token instead of logging in again:
+source ~/.agent_token
+
+## Errors:
+##  "OAuth is configured but no bearer token" / "Authorization method mismatch" -> source ~/.agent_token or log in again
+##  "localhost refused to connect" in browser -> your SSH window has no -L tunnel, reconnect with STEP 0.2
+##  "Port 3000 is already in use" -> run the pkill line above
+
+
+## =====================================================================================
+## STEP 7 — Talk to the financial assistant                                     [EC2]
+## =====================================================================================
+cd ~/Banking_support
+SID=$(python3 -c "import uuid;print(uuid.uuid4())"); echo "SESSION: $SID"
+q(){ uv run agentcore invoke -s $SID "{\"prompt\": \"$1\"}"; }
+
+## As JOHN (standard):
+q "Who am I and what accounts do I have?"
+q "What are my balances and when is my card payment due?"
+q "How much did I spend in February 2025 and what were my top categories?"
+q "Is anything on my card a duplicate or suspicious?"          # StreamFlix x2, QUICKPAY $399
+q "Dispute the second StreamFlix charge as a duplicate."       # asks to confirm
+q "Yes"                                                         # DSP-xxxxxx
+q "Move 200 dollars from checking to savings."                 # asks to confirm
+q "Yes"                                                         # TRF-xxxxxx
+q "What are my balances now?"                                   # updated balances
+q "Show me Jane Smith's balances."                              # must refuse
+q "Should I put my savings into crypto?"                        # no investment advice
+
+## As JANE (premium): log in as jane (STEP 6), then the duplicate is Harbor Grill $89.99 (TXN-2005).
+
+## Watch the agent's live logs (second EC2 window; paste the O helper from 4.5 first):
+aws logs tail /aws/bedrock-agentcore/runtimes/$(O RuntimeId)-DEFAULT --log-stream-name-prefix "$(date +%Y/%m/%d)/[runtime-logs]" --follow
+
+## Note: demo data lives in Lambda memory, so a redeploy or Lambda cold start resets balances.
+
+
+## =====================================================================================
+## STEP 8 — AgentCore Policy (Cedar guardrails)                          [WEB] + [EC2]
+## =====================================================================================
+## [WEB] AWS console -> Amazon Bedrock AgentCore (us-east-1) -> Policy
+##  8.1 Create policy engine -> name: supportAgentDemoPolicy -> Create
+##  8.2 Open it -> Create policy -> type each sentence -> Generate Cedar -> Create policy (3 times):
+##      Allow all authenticated users to call find_customer, get_customer, list_accounts, list_transactions, get_transaction, and get_spending_summary
+##      Allow users in the standard cognito:groups to call dispute_transaction only when the amount is less than or equal to 100
+##      Allow users in the standard cognito:groups to call transfer_funds only when the amount is less than or equal to 1000
+##      (Optional, so Jane can act too:)
+##      Allow users in the premium cognito:groups to call dispute_transaction and transfer_funds only when the amount is less than or equal to 5000
+##  8.3 Associate gateway -> supportAgentDemo-Gateway -> Enforcement mode: "Enable enforcement" -> Associate
+##      ("Emits logs only" = test mode: logs decisions but blocks nothing.)
+##      Anything no policy allows is DENIED once enforcement is on.
+
+## [EC2] Verify
+aws bedrock-agentcore-control list-policy-engines --region us-east-1 --output table
+aws bedrock-agentcore-control get-gateway --region us-east-1 --gateway-identifier $(O GatewayId) --query policyEngineConfiguration
+
+## [EC2] Test as JOHN (standard)
+SID=$(python3 -c "import uuid;print(uuid.uuid4())")
+q "I don't recognise the 399 dollar QUICKPAY charge. Please dispute the full amount."
+q "Yes"                                                          # expect: denied by policy
+q "Dispute the duplicate 15.99 StreamFlix charge."
+q "Yes"                                                          # expect: allowed (DSP-...)
+q "Move 1500 dollars from savings to checking."
+q "Yes"                                                          # expect: denied (> 1000)
+
+
+## =====================================================================================
+## STEP 9 — Traces and observability (CloudWatch)                              [EC2]
+## =====================================================================================
+REGION=us-east-1
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+## Shortcut for 9.1 + 9.2 in one command:  uv run scripts/observability.py setup   (check: ... check)
+
+## 9.1 Transaction Search (X-Ray spans -> CloudWatch Logs "aws/spans"). Once per account.
+aws xray get-trace-segment-destination --region $REGION      # CloudWatchLogs + ACTIVE = already on, skip to 9.2
+cat > /tmp/ts-policy.json <<EOF
+{"Version":"2012-10-17","Statement":[{"Sid":"TransactionSearchXRayAccess","Effect":"Allow",
+ "Principal":{"Service":"xray.amazonaws.com"},"Action":"logs:PutLogEvents",
+ "Resource":["arn:aws:logs:$REGION:$ACCOUNT:log-group:aws/spans:*","arn:aws:logs:$REGION:$ACCOUNT:log-group:/aws/application-signals/data:*"],
+ "Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:xray:$REGION:$ACCOUNT:*"},"StringEquals":{"aws:SourceAccount":"$ACCOUNT"}}}]}
+EOF
+aws logs put-resource-policy --region $REGION --policy-name AgentCoreTransactionSearch --policy-document file:///tmp/ts-policy.json
+aws xray update-trace-segment-destination --region $REGION --destination CloudWatchLogs
+## Optional: index 100% of traces for search (above 1% is billed)
+# aws xray update-indexing-rule --region $REGION --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":100}}'
+
+## 9.2 Gateway + Memory logs and traces (vended deliveries). Re-run after the memory is renamed/recreated.
+GW_ID=$(O GatewayId); MEM_ID=$(O MemoryId); MEM_ARN=$(O MemoryArn)
+GW_ARN=arn:aws:bedrock-agentcore:$REGION:$ACCOUNT:gateway/$GW_ID
+for pair in "$GW_ID $GW_ARN" "$MEM_ID $MEM_ARN"; do
+  set -- $pair; RID=$1; ARN=$2; GROUP=/aws/vendedlogs/bedrock-agentcore/$RID
+  aws logs create-log-group --region $REGION --log-group-name $GROUP 2>/dev/null
+  aws logs put-delivery-source --region $REGION --name $RID-logs-source --log-type APPLICATION_LOGS --resource-arn $ARN >/dev/null
+  DST=$(aws logs put-delivery-destination --region $REGION --name $RID-logs-destination --delivery-destination-type CWL \
+        --delivery-destination-configuration destinationResourceArn=arn:aws:logs:$REGION:$ACCOUNT:log-group:$GROUP \
+        --query deliveryDestination.arn --output text)
+  aws logs create-delivery --region $REGION --delivery-source-name $RID-logs-source --delivery-destination-arn $DST >/dev/null 2>&1
+  aws logs put-delivery-source --region $REGION --name $RID-traces-source --log-type TRACES --resource-arn $ARN >/dev/null
+  DST=$(aws logs put-delivery-destination --region $REGION --name $RID-traces-destination --delivery-destination-type XRAY \
+        --query deliveryDestination.arn --output text)
+  aws logs create-delivery --region $REGION --delivery-source-name $RID-traces-source --delivery-destination-arn $DST >/dev/null 2>&1
+  echo "OK: logs + traces on for $RID"
+done
+
+## 9.3 Check deliveries exist (should list 4: gateway logs/traces, memory logs/traces)
+aws logs describe-deliveries --region $REGION --query 'deliveries[].deliverySourceName' --output table
+
+## 9.4 Generate traffic (STEP 7), wait ~10 minutes the first time, then find spans for a session
+START=$(date -d '-1 hour' +%s); END=$(date +%s)
+QID=$(aws logs start-query --region $REGION --log-group-name aws/spans --start-time $START --end-time $END \
+      --query-string "fields @timestamp, name | filter @message like '$SID' | sort @timestamp asc | limit 100" \
+      --query queryId --output text)
+sleep 10; aws logs get-query-results --region $REGION --query-id $QID --output table
+
+## 9.5 Gateway and Memory log groups
+aws logs tail /aws/vendedlogs/bedrock-agentcore/$GW_ID --since 1h --region $REGION
+aws logs tail /aws/vendedlogs/bedrock-agentcore/$MEM_ID --since 1h --region $REGION
+
+## 9.6 [WEB] See traces visually:
+##   CloudWatch -> GenAI Observability -> Bedrock AgentCore -> Agents -> supportAgentDemo_Agent
+##   -> Sessions -> pick your session id -> Traces (each LLM call, tool call via Gateway, memory call, policy decision)
+##   CloudWatch -> Application Signals -> Transaction Search -> filter by session id
+
+
+## =====================================================================================
+## STEP 10 — AgentCore built-in evaluations                                     [EC2]
+## =====================================================================================
+## Run a conversation first (STEP 7), wait ~5 minutes so spans arrive, then:
+cd ~/Banking_support
+uv run agentcore eval run -s $SID \
+  -e Builtin.GoalSuccessRate -e Builtin.Helpfulness -e Builtin.Correctness -e Builtin.ToolSelectionAccuracy \
+  -o eval_$(date +%Y%m%d_%H%M).json
+## The screen shows a score, label and explanation for every turn; results are saved in the eval_*.json file.
+
+## Error "No spans found" -> wrong session id, or wait longer, or Transaction Search off (STEP 9.1)
+## Run all 7 test conversations in evals/cases.json and score each (report in eval-results/<time>/report.md):
+# uv run evals/run_eval.py
+## List all evaluators:            uv run agentcore eval evaluator list
+## Optional continuous evaluation (10% of live sessions):
+# uv run agentcore eval online create -n financialAssistant-online --sampling-rate 10 \
+#   -e Builtin.GoalSuccessRate -e Builtin.Helpfulness -e Builtin.ToolSelectionAccuracy
+
+## Baseline (2026-10-06, before fixes): GoalSuccess 1.00, ToolSelection 1.00, Helpfulness 0.88, Correctness 0.85
+
+
+## =====================================================================================
+## STEP 11 — SAVE / BACK UP all project files (no GitHub needed)                [EC2] + [PC]
+## =====================================================================================
+## 11.1 One time: create a private S3 bucket for backups
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=fintech-assistant-backup-$ACCOUNT
+aws s3 mb s3://$BUCKET --region us-east-1
+aws s3api put-public-access-block --bucket $BUCKET --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-versioning --bucket $BUCKET --versioning-configuration Status=Enabled   # keeps old versions
+
+## 11.2 Save (run after every change — only changed files are uploaded)
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text); BUCKET=fintech-assistant-backup-$ACCOUNT
+cd ~/Banking_support
+aws s3 sync . s3://$BUCKET/Banking_support --delete \
+  --exclude "*node_modules/*" --exclude "infra/cdk.out/*" \
+  --exclude ".venv/*" --exclude "*__pycache__/*" --exclude "*.tgz"
+aws s3 ls s3://$BUCKET/Banking_support/ --recursive --summarize | tail -2
+
+## 11.3 Restore on any EC2 (also STEP 2 Option B)
+# aws s3 sync s3://$BUCKET/Banking_support ~/Banking_support
+
+## 11.4 Copy a full backup to your PC
+##  [EC2] make the archive:
+tar --exclude=node_modules --exclude=cdk.out --exclude=.venv --exclude=__pycache__ \
+  -czf ~/fintech_backup.tgz -C ~/Banking_support . && ls -lh ~/fintech_backup.tgz
+##  [PC] (new Git Bash window) download it:
+#   scp -i ~/Downloads/Finance_support001.pem ec2-user@34.228.41.24:~/fintech_backup.tgz ~/Downloads/
+##  [PC] unpack to look at files:  mkdir -p ~/Downloads/fintech && tar -xzf ~/Downloads/fintech_backup.tgz -C ~/Downloads/fintech
+
+## 11.5 Copy one file from PC to EC2 (e.g. a fix I send you)                  [PC]
+#   scp -i ~/Downloads/Finance_support001.pem ~/Downloads/FILE ec2-user@34.228.41.24:~/
+
+
+## =====================================================================================
+## STEP 12 — UPDATE after changing code                                        [EC2]
+## =====================================================================================
+## 1) edit or copy the changed files into ~/Banking_support
+## 2) deploy (STEP 4.2):
+cd ~/Banking_support/infra && npx cdk deploy --all --outputs-file ../cdk-outputs.json --require-approval never && cd ..
+## 3) log in again if the token expired (STEP 6), test (STEP 7)
+## 4) if the memory was recreated, re-run STEP 9.2
+## 5) save (STEP 11.2)
+## Before deploying a change, run the tests:  uv run pytest -q && (cd infra && npm test)
+## Where things live: agent = src/financial_assistant/, tools = lambdas/banking_tools/,
+##   tool schemas = infra/lib/tool-schemas.ts, AWS resources = infra/lib/stacks/agentcore-stack.ts
+
+## Undo the last change from the automatic backups:
+ls -t ~/banking_backup_*.tgz 2>/dev/null | head -3
+# tar -xzf ~/banking_backup_<time>.tgz -C ~/Banking_support
+
+
+## =====================================================================================
+## STEP 13 — Daily quick start (instance already set up)                 [PC] -> [EC2]
+## =====================================================================================
+## [PC]  ssh -i ~/Downloads/Finance_support001.pem -L 3000:localhost:3000 ec2-user@34.228.41.24
+## [EC2]
+cd ~/Banking_support && source $HOME/.local/bin/env && export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh"
+eval $(uv run scripts/cognito-user.py --login --export) && echo "export BEDROCK_AGENTCORE_BEARER_TOKEN=$BEDROCK_AGENTCORE_BEARER_TOKEN" > ~/.agent_token
+SID=$(python3 -c "import uuid;print(uuid.uuid4())"); q(){ uv run agentcore invoke -s $SID "{\"prompt\": \"$1\"}"; }
+q "What are my balances?"
+
+
+## =====================================================================================
+## STEP 14 — CLEANUP (deletes everything that costs money)                      [EC2]
+## =====================================================================================
+## [WEB] first: Bedrock AgentCore -> Policy -> disassociate the gateway, delete policies and the engine
+# uv run agentcore eval online list
+GW_ID=$(O GatewayId); MEM_ID=$(O MemoryId)
+for d in $(aws logs describe-deliveries --region us-east-1 --query "deliveries[?starts_with(deliverySourceName,'$GW_ID') || starts_with(deliverySourceName,'$MEM_ID')].id" --output text); do
+  aws logs delete-delivery --region us-east-1 --id $d; done
+scripts/teardown.sh                        # or: cd infra && npx cdk destroy --all --force
+## Keep the S3 backup bucket unless you want it gone:
+# aws s3 rb s3://fintech-assistant-backup-$ACCOUNT --force
+## Stop the EC2 instance in the console when you're not using it (the IP changes after a restart).

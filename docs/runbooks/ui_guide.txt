@@ -1,0 +1,151 @@
+## =====================================================================================
+##  FINANCIAL ASSISTANT — CHAT UI GUIDE (build, run, demo)
+##  Last updated: 2026-10-13
+##
+##  What you get: a web chat page (Streamlit) where a customer signs in with Cognito and talks
+##  to the REAL deployed agent. Every message calls the AgentCore Runtime with that user's token,
+##  so Gateway tools, Cedar Policy, Memory and CloudWatch traces all work exactly like STEP 7 of
+##  commands_ec2.txt. When the agent asks "reply yes to confirm", the page shows Yes / No buttons.
+##
+##  HOW TO READ THIS FILE  (same rules as commands_ec2.txt)
+##   [PC]   = run in Git Bash on your laptop      (prompt looks like: Shakti@LAPTOP-... )
+##   [EC2]  = run on the EC2 server               (prompt looks like: [ec2-user@ip-... ]$ )
+##   [WEB]  = do it in a browser on your PC
+##   Paste ONE block at a time and wait for it to finish.
+##   Lines starting with ## are notes — do not paste them.
+##
+##  YOUR VALUES
+##   Key file : ~/Downloads/Finance_support001.pem
+##   EC2 IP   : 34.228.41.24
+##   Project  : ~/Banking_support on EC2
+##   UI page  : http://localhost:8501        Login callback: http://localhost:3000/callback
+##
+##  BEFORE YOU START: the agent must already be deployed (commands_ec2.txt STEP 4) and the users
+##  created (STEP 5). The UI needs nothing new in AWS: no redeploy, no new permissions.
+## =====================================================================================
+
+
+## =====================================================================================
+## HOW IT WORKS (read once)
+## =====================================================================================
+##  Browser ──> Streamlit page (ui/app.py, port 8501)
+##     │  "Sign in with Cognito"  ──> Cognito hosted login ──> http://localhost:3000/callback
+##     │                              (ui/agent_client.py runs that small server on port 3000,
+##     │                               swaps the code for tokens, sends you back to the page)
+##     └─ each message ──> POST https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/<RuntimeArn>/invocations
+##                          Authorization: Bearer <your access token>  ──> Runtime ──> Gateway ──> Policy ──> Lambda
+##
+##  Files:
+##   ui/app.py            the page: sign-in, chat, sidebar, Yes/No confirmation buttons
+##   ui/agent_client.py   Cognito PKCE login, token refresh, calling the Runtime and reading its stream
+##   ui/requirements.txt  streamlit + requests (installed on the fly by "uv run --with-requirements")
+##   tests/unit/test_ui_client.py   unit tests for agent_client.py (in the repo, not in the .tgz)
+##
+##  It reads RuntimeArn, ClientId, CognitoDomain and Region from cdk-outputs.json in the project
+##  root (written by the deploy). Port 3000 is used because it is the only callback URL the Cognito
+##  app client allows (infra/lib/stacks/agentcore-stack.ts).
+
+
+## =====================================================================================
+## STEP U1 — Put the ui/ folder on EC2 (once)                              [WEB] + [PC] + [EC2]
+## =====================================================================================
+## [WEB] Download Finance_Assistant_UI.tgz from the project files (Project_Demo folder)
+##       into your PC Downloads folder.
+
+## [PC]  copy it to EC2
+scp -i ~/Downloads/Finance_support001.pem ~/Downloads/Finance_Assistant_UI.tgz ec2-user@34.228.41.24:~/
+
+## [EC2] unpack it into the project (adds ui/ and this guide; nothing else is touched)
+cd ~/Banking_support
+tar -xzf ~/Finance_Assistant_UI.tgz -C ~/Banking_support
+ls ui/                                  # agent_client.py  app.py  requirements.txt
+ls cdk-outputs.json                     # must exist; if not, run the deploy (commands_ec2.txt STEP 4)
+
+
+## =====================================================================================
+## STEP U2 — Connect with BOTH tunnels                                           [PC]
+## =====================================================================================
+## Port 3000 = Cognito login callback, port 8501 = the chat page. Close older SSH windows first.
+
+ssh -i ~/Downloads/Finance_support001.pem -L 3000:localhost:3000 -L 8501:localhost:8501 ec2-user@34.228.41.24
+
+## The prompt must now say [ec2-user@ip-...]$ . The next step runs here.
+
+
+## =====================================================================================
+## STEP U3 — Start the UI                                                        [EC2]
+## =====================================================================================
+cd ~/Banking_support && source $HOME/.local/bin/env
+pkill -f cognito-user.py; pkill -f "streamlit run"; sudo fuser -k 3000/tcp 8501/tcp 2>/dev/null; sleep 1   # frees the ports
+uv run --with-requirements ui/requirements.txt streamlit run ui/app.py --server.address localhost --server.port 8501 --client.toolbarMode minimal
+## The first start downloads Streamlit (about 1 minute). Wait for:
+##    You can now view your Streamlit app in your browser.  URL: http://localhost:8501
+## Leave this window open. Ctrl+C stops the UI.
+## On the v0.2.0 layout with the latest Makefile, "make ui" runs the same command.
+
+
+## =====================================================================================
+## STEP U4 — Use it                                                              [WEB]
+## =====================================================================================
+## 1. On your PC open  http://localhost:8501
+## 2. Click "Sign in with Cognito" and log in as john@example.com (password from STEP 5).
+##    You come back to the chat automatically, with "john@example.com · Group: standard" in the sidebar.
+## 3. Demo script (type it, or click the "Try asking" buttons in the sidebar):
+##      Who am I and what accounts do I have?
+##      What are my balances and when is my card payment due?
+##      Is anything on my card a duplicate or suspicious?          (StreamFlix x2, QUICKPAY $399)
+##      Dispute the second StreamFlix charge as a duplicate.        -> Yes / No buttons appear
+##      click "Yes, confirm"                                         -> DSP-xxxxxx
+##      Move 200 dollars from checking to savings.                  -> Yes / No buttons appear
+##      click "Yes, confirm"                                         -> TRF-xxxxxx
+##      What are my balances now?
+##      Show me Jane Smith's balances.                              (must refuse)
+## 4. "New conversation" starts a new Runtime session. The session id is shown at the bottom of
+##    the sidebar: use it for traces (commands_ec2.txt STEP 9.4) and evaluations (STEP 10).
+## 5. Switch user: click "Sign out" (logs out of Cognito), then sign in as jane@example.com.
+##
+## The token lasts 1 hour, but the page renews it by itself with the refresh token, so you can
+## keep chatting. If you used "Use a token from the terminal instead", it is NOT renewed.
+
+
+## =====================================================================================
+## STEP U5 — Keep the UI running after you close SSH (optional)                  [EC2]
+## =====================================================================================
+cd ~/Banking_support
+nohup uv run --with-requirements ui/requirements.txt streamlit run ui/app.py --server.address localhost --server.port 8501 --client.toolbarMode minimal > ~/ui.log 2>&1 &
+tail -5 ~/ui.log                         # shows the Streamlit URL lines
+## Later, open it again from your PC with the STEP U2 ssh command, then http://localhost:8501
+## Stop it:
+# pkill -f "streamlit run"
+
+
+## =====================================================================================
+## STEP U6 — Run the UI on your PC instead of EC2 (optional)              [EC2] + [PC]
+## =====================================================================================
+## The UI needs no AWS credentials: only cdk-outputs.json and a Cognito user.
+## Needs uv on Windows:  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"  (then reopen Git Bash)
+
+## [PC] copy cdk-outputs.json from EC2 into your local checkout (which must contain ui/ from STEP U1)
+cd "/d/AWS project reposetory/Fintech_support/Fintech_support"
+tar -xzf ~/Downloads/Finance_Assistant_UI.tgz
+scp -i ~/Downloads/Finance_support001.pem ec2-user@34.228.41.24:~/Banking_support/cdk-outputs.json .
+
+## [PC] start it (no ssh tunnel needed; ports 3000 and 8501 on your PC must be free)
+uv run --with-requirements ui/requirements.txt streamlit run ui/app.py --server.address localhost --server.port 8501
+## open http://localhost:8501
+
+
+## =====================================================================================
+## TROUBLESHOOTING
+## =====================================================================================
+##  "localhost refused to connect" on 8501   -> SSH window has no -L 8501 tunnel, or the UI is not running (STEP U2, U3)
+##  "localhost refused to connect" on 3000   -> SSH window has no -L 3000 tunnel; reconnect with STEP U2
+##  Page says "Port 3000 is busy"            -> cognito-user.py --login is still waiting; run the pkill line of STEP U3, restart
+##  "Could not read cdk-outputs.json"        -> run the UI from ~/Banking_support; deploy first if the file is missing
+##  "Runtime returned 401/403 ... sign in"   -> token expired or from another deploy: Sign out, sign in again
+##  "Runtime returned 424" or a timeout      -> the agent itself failed: check its logs (commands_ec2.txt STEP 7, "aws logs tail ...")
+##  Policy denial text in the reply          -> expected: Cedar blocked the tool call (STEP 8)
+##  Balances back to the start values        -> normal: demo data lives in Lambda memory (redeploy or cold start resets it)
+##
+##  NEVER open port 8501 or 3000 in the EC2 security group: the page is only meant to be reached
+##  through the SSH tunnel (it listens on localhost only).
